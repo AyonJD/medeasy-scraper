@@ -1,0 +1,23 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+sqlalchemy==2.0.23
+# psycopg2-binary==2.9.9  # PostgreSQL driver - not needed for local
+# alembic==1.12.1  # Database migrations - not needed for local
+requests==2.31.0
+beautifulsoup4==4.12.2
+selenium==4.15.2
+webdriver-manager==4.0.1
+aiohttp==3.9.1
+asyncio-throttle==1.0.2
+python-dotenv==1.0.0
+pydantic==2.5.0
+schedule==1.2.0
+loguru==0.7.2
+# redis==5.0.1  # Redis - not needed for local
+# celery==5.3.4  # Task queue - not needed for local
+pandas==2.1.4
+numpy==1.25.2
+lxml==4.9.3
+fake-useragent==1.4.0
+retrying==1.3.4
+Pillow==10.1.0 
