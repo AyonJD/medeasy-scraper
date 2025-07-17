@@ -6,8 +6,8 @@ from urllib.parse import urljoin, urlparse
 from loguru import logger
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
-from database.models import Medicine, MedicineImage, ScrapingProgress, ScrapingLog
-from database.connection_vps import SessionLocal
+from database.models import Medicine, MedicineImage, ScrapingProgress, ScrapingLog, Category
+from database.connection_vps import get_session_local
 from scrapers.base_scraper import BaseScraper
 from utils.image_processor import ImageProcessor
 from config_vps import Config
@@ -33,7 +33,7 @@ class MedEasyScraperVPS(BaseScraper):
     
     def log_scraping_event(self, level: str, message: str, url: str = None):
         """Log scraping events to database"""
-        db = SessionLocal()
+        db = get_session_local()()
         try:
             log_entry = ScrapingLog(
                 task_name=self.task_name,
@@ -50,7 +50,7 @@ class MedEasyScraperVPS(BaseScraper):
     
     def update_progress(self, current_page: int, total_pages: int, processed_items: int, total_items: int, status: str = "running"):
         """Update scraping progress in database"""
-        db = SessionLocal()
+        db = get_session_local()()
         try:
             progress = db.query(ScrapingProgress).filter_by(task_name=self.task_name).first()
             if not progress:
@@ -84,7 +84,7 @@ class MedEasyScraperVPS(BaseScraper):
     
     def get_resume_data(self) -> Optional[Dict]:
         """Get resume data from database"""
-        db = SessionLocal()
+        db = get_session_local()()
         try:
             progress = db.query(ScrapingProgress).filter_by(task_name=self.task_name).first()
             if progress and progress.resume_data:
@@ -97,7 +97,7 @@ class MedEasyScraperVPS(BaseScraper):
     
     def save_resume_data(self, resume_data: Dict):
         """Save resume data to database"""
-        db = SessionLocal()
+        db = get_session_local()()
         try:
             progress = db.query(ScrapingProgress).filter_by(task_name=self.task_name).first()
             if not progress:
@@ -527,15 +527,10 @@ class MedEasyScraperVPS(BaseScraper):
                         medicine_data['manufacturer'] = text
                         break
             
-            # 6. Extract category from breadcrumbs
-            breadcrumb_selectors = ['.breadcrumb', '.nav', '[class*="breadcrumb"]']
-            for selector in breadcrumb_selectors:
-                element = soup.select_one(selector)
-                if element:
-                    links = element.find_all('a')
-                    if len(links) > 1:
-                        medicine_data['category'] = self.clean_text(links[-2].get_text(strip=True))
-                        break
+            # 6. Extract category from URL path and map to category ID
+            category_id = self.extract_category_id_from_url(url)
+            if category_id:
+                medicine_data['category_id'] = category_id
             
             # 7. Extract additional details
             detail_selectors = ['.product-details', '.medicine-details', '.details']
@@ -561,9 +556,54 @@ class MedEasyScraperVPS(BaseScraper):
         
         return medicine_data
     
+    def extract_category_id_from_url(self, url: str) -> Optional[int]:
+        """Extract category ID from URL by matching URL path to category URLs"""
+        from urllib.parse import urlparse
+        
+        try:
+            parsed_url = urlparse(url)
+            path = parsed_url.path
+            
+            # Map URL paths to category keys
+            url_to_category_map = {
+                '/womens-choice': 'womens-choice',
+                '/sexual-wellness': 'sexual-wellness',
+                '/skin-care': 'skin-care',
+                '/diabetic-care': 'diabetic-care',
+                '/devices': 'devices',
+                '/supplement': 'supplement',
+                '/diapers': 'diapers',
+                '/baby-care': 'baby-care',
+                '/personal-care': 'personal-care',
+                '/Hygiene-And-Freshness': 'hygiene-and-freshness',
+                '/dental-care': 'dental-care',
+                '/Herbal-Medicine': 'herbal-medicine',
+                '/prescription-medicine': 'prescription-medicine',
+                '/otc-medicine': 'otc-medicine'
+            }
+            
+            # Find matching category
+            for url_path, category_key in url_to_category_map.items():
+                if url_path in path:
+                    # Get category ID from database
+                    db = get_session_local()()
+                    try:
+                        category = db.query(Category).filter_by(slug=category_key).first()
+                        if category:
+                            return category.id
+                    finally:
+                        db.close()
+                    break
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting category ID from URL {url}: {e}")
+            return None
+    
     def save_medicine_to_db(self, medicine_data: Dict[str, Any], image_data: Optional[Dict] = None) -> bool:
         """Save medicine data to database with image support"""
-        db = SessionLocal()
+        db = get_session_local()()
         try:
             # Check if medicine already exists
             existing = db.query(Medicine).filter_by(product_url=medicine_data['product_url']).first()
@@ -598,9 +638,8 @@ class MedEasyScraperVPS(BaseScraper):
                     'dosage_instructions': dosage_instructions,
                     'storage_conditions': medicine_data.get('storage_conditions', ''),
                     'product_code': medicine_data.get('product_code', ''),
-                    'category': medicine_data.get('category', ''),
-                    'subcategory': medicine_data.get('subcategory', ''),
-                    'product_url': medicine_data.get('product_url', ''),
+                    'category_id': medicine_data.get('category_id'),
+                    'subcategory_id': None,
                     'image_url': medicine_data.get('image_url', ''),
                     'raw_data': medicine_data.get('raw_data', {}),
                     'is_active': True

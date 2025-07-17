@@ -1,13 +1,13 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Dict, Any
 import asyncio
 from datetime import datetime
 
 from database.connection_local import get_db, init_db, check_db_connection
-from database.models import Medicine, MedicineImage, ScrapingProgress, ScrapingLog
+from database.models import Medicine, MedicineImage, ScrapingProgress, ScrapingLog, Category
 from scrapers.medeasy_scraper_local import MedEasyScraperLocal
 from config_local import Config
 from loguru import logger
@@ -184,7 +184,13 @@ async def get_medicines(
             )
         
         if category:
-            query = query.filter(Medicine.category.ilike(f"%{category}%"))
+            # Filter by category ID directly
+            try:
+                category_id = int(category)
+                query = query.filter(Medicine.category_id == category_id)
+            except ValueError:
+                # If category is not a number, try to filter by category name through relationship
+                query = query.join(Medicine.category_ref).filter(Category.name.ilike(f"%{category}%"))
         
         if manufacturer:
             query = query.filter(Medicine.manufacturer.ilike(f"%{manufacturer}%"))
@@ -192,8 +198,11 @@ async def get_medicines(
         # Get total count
         total = query.count()
         
-        # Apply pagination
-        medicines = query.offset(skip).limit(limit).all()
+        # Apply pagination and load relationships
+        medicines = query.options(
+            joinedload(Medicine.subcategory_ref),
+            joinedload(Medicine.images)
+        ).offset(skip).limit(limit).all()
         
         return {
             "medicines": [
@@ -208,8 +217,7 @@ async def get_medicines(
                     "pack_size": med.pack_size,
                     "price": med.price,
                     "currency": med.currency,
-                    "category": med.category_ref.name if med.category_ref else None,
-                    "subcategory": med.subcategory_ref.name if med.subcategory_ref else None,
+                    "category": med.category_id,  # Use the category_id field directly (which contains the ID)
                     "product_code": med.product_code,
                     "image_url": med.image_url,
                     "has_image": len(med.images) > 0,
@@ -230,7 +238,10 @@ async def get_medicines(
 async def get_medicine(medicine_id: int, db: Session = Depends(get_db)):
     """Get a specific medicine by ID"""
     try:
-        medicine = db.query(Medicine).filter(Medicine.id == medicine_id).first()
+        medicine = db.query(Medicine).options(
+            joinedload(Medicine.subcategory_ref),
+            joinedload(Medicine.images)
+        ).filter(Medicine.id == medicine_id).first()
         
         if not medicine:
             raise HTTPException(status_code=404, detail="Medicine not found")
@@ -252,8 +263,7 @@ async def get_medicine(medicine_id: int, db: Session = Depends(get_db)):
             "side_effects": medicine.side_effects,
             "dosage_instructions": medicine.dosage_instructions,
             "storage_conditions": medicine.storage_conditions,
-            "category": medicine.category_ref.name if medicine.category_ref else None,
-            "subcategory": medicine.subcategory_ref.name if medicine.subcategory_ref else None,
+            "category": medicine.category_id,  # Use the category_id field directly (which contains the ID)
             "product_code": medicine.product_code,
             "image_url": medicine.image_url,
             "has_image": len(medicine.images) > 0,

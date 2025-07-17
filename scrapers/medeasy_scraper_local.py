@@ -328,34 +328,56 @@ class MedEasyScraperLocal(BaseScraper):
             logger.error(f"Error processing image {image_url}: {e}")
             return None
     
-    async def discover_medicine_urls(self) -> List[str]:
-        """Discover all medicine URLs from all categories"""
+    async def discover_medicine_urls(self) -> List[Dict]:
+        """Discover all medicine URLs from all categories, attaching category_id to each"""
         medicine_urls = []
-        
         logger.info("Starting discovery from all categories")
-        
         try:
-            # Generate URLs for all categories and their pages
-            for category_name, category_info in Config.CATEGORIES.items():
+            # Hardcoded mapping of category slugs to IDs
+            category_mappings = {
+                'womens-choice': 1,
+                'sexual-wellness': 2,
+                'skin-care': 3,
+                'diabetic-care': 4,
+                'devices': 5,
+                'supplement': 6,
+                'diapers': 7,
+                'baby-care': 8,
+                'personal-care': 9,
+                'hygiene-and-freshness': 10,
+                'dental-care': 11,
+                'herbal-medicine': 12,
+                'prescription-medicine': 13,
+                'otc-medicine': 14
+            }
+            for category_slug, category_info in Config.CATEGORIES.items():
+                category_id = category_mappings.get(category_slug)
+                if not category_id:
+                    logger.warning(f"No category ID found for slug: {category_slug}")
+                    continue
                 category_url = category_info['url']
                 total_pages = category_info['pages']
-                
-                logger.info(f"Processing category: {category_name} ({total_pages} pages)")
-                
-                # Generate URLs for all pages in this category
+                logger.info(f"Processing category: {category_slug} (ID: {category_id}, {total_pages} pages)")
                 for page in range(1, total_pages + 1):
                     if page == 1:
-                        # First page doesn't need ?page=1
                         page_url = f"{self.base_url}{category_url}"
                     else:
                         page_url = f"{self.base_url}{category_url}?page={page}"
-                    
-                    medicine_urls.append(page_url)
-                    logger.debug(f"Added category page: {page_url}")
-            
-            logger.info(f"Discovered {len(medicine_urls)} category listing pages across all categories")
+                    logger.debug(f"Fetching category page: {page_url}")
+                    content = await self.fetch_page_async(page_url)
+                    if not content:
+                        logger.warning(f"Failed to fetch category page: {page_url}")
+                        continue
+                    soup = self.parse_html(content)
+                    medicine_links = self.extract_medicine_links_from_page(soup)
+                    for med_url in medicine_links:
+                        medicine_urls.append({
+                            'url': med_url,
+                            'category_id': category_id
+                        })
+                    logger.info(f"Found {len(medicine_links)} medicines on page {page} for category {category_slug}")
+            logger.info(f"Discovered {len(medicine_urls)} total medicines across all categories")
             return medicine_urls
-            
         except Exception as e:
             logger.error(f"Error discovering medicine URLs: {e}")
             self.log_scraping_event("ERROR", f"Error discovering medicine URLs: {e}")
@@ -415,11 +437,13 @@ class MedEasyScraperLocal(BaseScraper):
         logger.info(f"Extracted {len(medicine_links)} medicine links from page")
         return medicine_links
     
-    def extract_medicine_data(self, soup: BeautifulSoup, url: str) -> Dict[str, Any]:
-        """Extract medicine data from product page using structured data and HTML"""
+    def extract_medicine_data(self, soup: BeautifulSoup, url: str, category_id: int = None) -> Dict[str, Any]:
+        """Extract medicine data from product page using structured data and HTML, using passed category_id"""
         medicine_data = {
             'raw_data': {}
         }
+        if category_id is not None:
+            medicine_data['category_id'] = category_id
         
         try:
             # 1. Extract from structured data (JSON-LD) - Most reliable
@@ -505,15 +529,10 @@ class MedEasyScraperLocal(BaseScraper):
                         medicine_data['manufacturer'] = text
                         break
             
-            # 6. Extract category from breadcrumbs
-            breadcrumb_selectors = ['.breadcrumb', '.nav', '[class*="breadcrumb"]']
-            for selector in breadcrumb_selectors:
-                element = soup.select_one(selector)
-                if element:
-                    links = element.find_all('a')
-                    if len(links) > 1:
-                        medicine_data['category'] = self.clean_text(links[-2].get_text(strip=True))
-                        break
+            # 6. Extract category from URL path and map to category ID
+            # category_id = self.extract_category_id_from_url(url) # This line is removed as category_id is now passed
+            if category_id:
+                medicine_data['category_id'] = category_id
             
             # 7. Extract additional details
             detail_selectors = ['.product-details', '.medicine-details', '.details']
@@ -539,6 +558,89 @@ class MedEasyScraperLocal(BaseScraper):
         
         return medicine_data
     
+    def extract_category_id_from_url(self, url: str) -> Optional[int]:
+        """Extract category ID from URL using hardcoded mapping"""
+        from urllib.parse import urlparse
+        
+        try:
+            parsed_url = urlparse(url)
+            path = parsed_url.path
+            
+            # Hardcoded mapping of URL paths to category IDs
+            url_to_category_id_map = {
+                '/womens-choice': 1,
+                '/sexual-wellness': 2,
+                '/skin-care': 3,
+                '/diabetic-care': 4,
+                '/devices': 5,
+                '/supplement': 6,
+                '/diapers': 7,
+                '/baby-care': 8,
+                '/personal-care': 9,
+                '/Hygiene-And-Freshness': 10,
+                '/hygiene-and-freshness': 10,
+                '/dental-care': 11,
+                '/Herbal-Medicine': 12,
+                '/herbal-medicine': 12,
+                '/prescription-medicine': 13,
+                '/otc-medicine': 14
+            }
+            
+            # First, try to find category in the URL path
+            for url_path, category_id in url_to_category_id_map.items():
+                if url_path in path:
+                    logger.info(f"Found category from URL path '{url_path}' -> ID: {category_id}")
+                    return category_id
+            
+            # If not found in path, try to extract from medicine URL pattern
+            # Medicine URLs are like: /medicines/product-name-category-slug
+            if '/medicines/' in path:
+                # Extract the last part of the URL which contains the category
+                url_parts = path.split('/')
+                if len(url_parts) > 2:
+                    medicine_slug = url_parts[-1]  # Get the last part
+                    
+                    # Look for category patterns in the medicine slug
+                    category_patterns = {
+                        'women-s-choice': 1,
+                        'womens-choice': 1,
+                        'sexual-wellness': 2,
+                        'skin-care': 3,
+                        'skincare': 3,
+                        'diabetic-care': 4,
+                        'diabetes': 4,
+                        'devices': 5,
+                        'supplement': 6,
+                        'supplements': 6,
+                        'diapers': 7,
+                        'baby-care': 8,
+                        'babycare': 8,
+                        'personal-care': 9,
+                        'personalcare': 9,
+                        'hygiene-and-freshness': 10,
+                        'hygiene': 10,
+                        'dental-care': 11,
+                        'dental': 11,
+                        'herbal-medicine': 12,
+                        'herbal': 12,
+                        'prescription-medicine': 13,
+                        'prescription': 13,
+                        'otc-medicine': 14,
+                        'otc': 14
+                    }
+                    
+                    for pattern, category_id in category_patterns.items():
+                        if pattern in medicine_slug:
+                            logger.info(f"Found category from medicine slug pattern '{pattern}' -> ID: {category_id}")
+                            return category_id
+            
+            logger.warning(f"No category mapping found for URL path: {path}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting category ID from URL {url}: {e}")
+            return None
+    
     def save_medicine_to_db(self, medicine_data: Dict[str, Any], image_data: Optional[Dict] = None) -> bool:
         """Save medicine data to database with optional image"""
         db = SessionLocal()
@@ -549,21 +651,13 @@ class MedEasyScraperLocal(BaseScraper):
                 existing = db.query(Medicine).filter_by(product_code=medicine_data['product_code']).first()
             
             if existing:
-                # Handle categories for existing medicine
-                if medicine_data.get('category'):
-                    category = self.category_manager.get_or_create_category(medicine_data['category'])
-                    if category:
-                        existing.category_id = category.id
-                        self.category_manager.commit()
-                
-                if medicine_data.get('subcategory'):
-                    subcategory = self.category_manager.get_or_create_subcategory(
-                        medicine_data.get('category', 'General'), 
-                        medicine_data['subcategory']
-                    )
-                    if subcategory:
-                        existing.subcategory_id = subcategory.id
-                        self.category_manager.commit()
+                # Update existing medicine with new data
+                for key, value in medicine_data.items():
+                    if key != 'raw_data' and hasattr(existing, key):
+                        setattr(existing, key, value)
+                existing.last_scraped = func.now()
+                logger.info(f"Updated existing medicine: {medicine_data.get('name', 'Unknown')}")
+                medicine = existing
                 
                 # Process and save image if provided
                 if image_data:
@@ -595,24 +689,9 @@ class MedEasyScraperLocal(BaseScraper):
                 # Map details to dosage_instructions if available
                 dosage_instructions = medicine_data.get('details', '') or medicine_data.get('dosage_instructions', '')
                 
-                # Handle categories first
-                category_id = None
+                # Get category_id from medicine_data (already extracted from URL)
+                category_id = medicine_data.get('category_id')
                 subcategory_id = None
-                
-                if medicine_data.get('category'):
-                    category = self.category_manager.get_or_create_category(medicine_data['category'])
-                    if category:
-                        category_id = category.id
-                        self.category_manager.commit()
-                
-                if medicine_data.get('subcategory'):
-                    subcategory = self.category_manager.get_or_create_subcategory(
-                        medicine_data.get('category', 'General'), 
-                        medicine_data['subcategory']
-                    )
-                    if subcategory:
-                        subcategory_id = subcategory.id
-                        self.category_manager.commit()
                 
                 # Process and save image if provided
                 image_url = None
@@ -708,24 +787,16 @@ class MedEasyScraperLocal(BaseScraper):
         finally:
             db.close()
     
-    async def scrape_medicine_page(self, url: str) -> bool:
-        """Scrape a single medicine page"""
+    async def scrape_medicine_page(self, url: str, category_id: int = None) -> bool:
+        """Scrape a single medicine page, using passed category_id"""
         try:
             logger.info(f"Scraping medicine page: {url}")
-            
-            # Fetch page content
             content = await self.fetch_page_async(url)
             if not content:
                 logger.warning(f"Failed to fetch content from: {url}")
                 return False
-            
-            # Parse HTML
             soup = self.parse_html(content)
-            
-            # Extract medicine data
-            medicine_data = self.extract_medicine_data(soup, url)
-            
-            # Extract and process image
+            medicine_data = self.extract_medicine_data(soup, url, category_id)
             image_data = None
             image_url = self.extract_image_url(soup)
             if image_url:
@@ -737,9 +808,7 @@ class MedEasyScraperLocal(BaseScraper):
                     logger.warning(f"Failed to process image from: {image_url}")
             else:
                 logger.debug(f"No image found on page: {url}")
-            
-            # Save to database
-            if medicine_data.get('name'):  # Only save if we have at least a name
+            if medicine_data.get('name'):
                 success = self.save_medicine_to_db(medicine_data, image_data)
                 if success:
                     self.log_scraping_event("INFO", f"Successfully scraped medicine: {medicine_data.get('name')}", url)
@@ -751,100 +820,57 @@ class MedEasyScraperLocal(BaseScraper):
                 logger.warning(f"No medicine name found on page: {url}")
                 self.log_scraping_event("WARNING", "No medicine name found on page", url)
                 return False
-                
         except Exception as e:
             logger.error(f"Error scraping medicine page {url}: {e}")
             self.log_scraping_event("ERROR", f"Error scraping medicine page: {e}", url)
             return False
     
     async def scrape_all_medicines(self, resume: bool = True):
-        """Main method to scrape all medicines"""
+        """Main method to scrape all medicines, using category_id from discovery"""
         try:
-            logger.info("Starting MedEasy medicine scraping (Local)")
-            self.log_scraping_event("INFO", "Starting MedEasy medicine scraping (Local)")
-            
-            # Check for resume data
+            logger.info("Starting MedEasy medicine scraping (local)")
+            self.log_scraping_event("INFO", "Starting MedEasy medicine scraping (local)")
             resume_data = None
             if resume:
                 resume_data = self.get_resume_data()
                 if resume_data:
                     logger.info("Resuming from previous session")
                     self.log_scraping_event("INFO", "Resuming from previous session")
-            
-            # Discover medicine URLs
-            if resume_data and 'listing_urls' in resume_data:
-                listing_urls = resume_data['listing_urls']
-                current_page = resume_data.get('current_page', 1)
+            if resume_data and 'medicine_urls' in resume_data:
+                medicine_urls = resume_data['medicine_urls']
+                current_index = resume_data.get('current_index', 0)
                 processed_items = resume_data.get('processed_items', 0)
             else:
-                listing_urls = await self.discover_medicine_urls()
-                current_page = 1
+                medicine_urls = await self.discover_medicine_urls()
+                current_index = 0
                 processed_items = 0
-            
-            if not listing_urls:
-                logger.error("No medicine listing URLs found")
-                self.log_scraping_event("ERROR", "No medicine listing URLs found")
+            if not medicine_urls:
+                logger.error("No medicine URLs found")
+                self.log_scraping_event("ERROR", "No medicine URLs found")
                 return
-            
-            total_pages = len(listing_urls)
-            total_items = 0
-            
-            # Update progress
-            self.update_progress(current_page, total_pages, processed_items, total_items)
-            
-            # Process each listing page
-            for page_idx, listing_url in enumerate(listing_urls[current_page-1:], current_page):
+            total_items = len(medicine_urls)
+            self.update_progress(1, 1, processed_items, total_items)
+            for idx, med_info in enumerate(medicine_urls[current_index:], current_index):
                 try:
-                    logger.info(f"Processing page {page_idx}/{total_pages}: {listing_url}")
-                    
-                    # Fetch listing page
-                    content = await self.fetch_page_async(listing_url)
-                    if not content:
-                        logger.warning(f"Failed to fetch listing page: {listing_url}")
-                        continue
-                    
-                    # Parse HTML
-                    soup = self.parse_html(content)
-                    
-                    # Extract medicine links
-                    medicine_links = self.extract_medicine_links_from_page(soup)
-                    total_items += len(medicine_links)
-                    
-                    # Update progress
-                    self.update_progress(page_idx, total_pages, processed_items, total_items)
-                    
-                    # Process each medicine link
-                    for link in medicine_links:
-                        try:
-                            success = await self.scrape_medicine_page(link)
-                            if success:
-                                processed_items += 1
-                            
-                            # Update progress
-                            self.update_progress(page_idx, total_pages, processed_items, total_items)
-                            
-                            # Save resume data
-                            resume_data = {
-                                'listing_urls': listing_urls,
-                                'current_page': page_idx,
-                                'processed_items': processed_items,
-                                'current_medicine_index': medicine_links.index(link)
-                            }
-                            self.save_resume_data(resume_data)
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing medicine link {link}: {e}")
-                            self.log_scraping_event("ERROR", f"Error processing medicine link: {e}", link)
-                    
+                    url = med_info['url']
+                    category_id = med_info.get('category_id')
+                    logger.info(f"Processing medicine {idx + 1}/{total_items}: {url} (Category ID: {category_id})")
+                    success = await self.scrape_medicine_page(url, category_id)
+                    if success:
+                        processed_items += 1
+                    self.update_progress(1, 1, processed_items, total_items)
+                    resume_data = {
+                        'medicine_urls': medicine_urls,
+                        'current_index': idx + 1,
+                        'processed_items': processed_items
+                    }
+                    self.save_resume_data(resume_data)
                 except Exception as e:
-                    logger.error(f"Error processing listing page {listing_url}: {e}")
-                    self.log_scraping_event("ERROR", f"Error processing listing page: {e}", listing_url)
-            
-            # Mark as completed
-            self.update_progress(total_pages, total_pages, processed_items, total_items, "completed")
+                    logger.error(f"Error processing medicine {url}: {e}")
+                    self.log_scraping_event("ERROR", f"Error processing medicine: {e}", url)
+            self.update_progress(1, 1, processed_items, total_items, "completed")
             logger.info(f"Scraping completed. Processed {processed_items} medicines")
             self.log_scraping_event("INFO", f"Scraping completed. Processed {processed_items} medicines")
-            
         except Exception as e:
             logger.error(f"Error in scrape_all_medicines: {e}")
             self.log_scraping_event("ERROR", f"Error in scrape_all_medicines: {e}")

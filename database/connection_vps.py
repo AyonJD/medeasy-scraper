@@ -1,53 +1,35 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
 from config_vps import Config
-from loguru import logger
 
-# Create database engine
-engine = create_engine(
-    Config.DATABASE_URL,
-    pool_size=20,
-    max_overflow=30,
-    pool_pre_ping=True,
-    pool_recycle=3600
-)
+# Create engine for VPS database (lazy loading to avoid import errors)
+_engine = None
+_SessionLocal = None
 
-# Create session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+def get_engine():
+    """Get VPS database engine with lazy loading"""
+    global _engine
+    if _engine is None:
+        try:
+            _engine = create_engine(Config.DATABASE_URL)
+        except Exception as e:
+            raise Exception(f"Failed to create VPS database engine: {e}. Make sure psycopg2 is installed for PostgreSQL support.")
+    return _engine
 
-# Create base class for models
-Base = declarative_base()
+def get_session_local():
+    """Get VPS session factory with lazy loading"""
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=get_engine())
+    return _SessionLocal
 
-def init_db():
-    """Initialize database tables"""
-    try:
-        # Import all models to ensure they are registered
-        from database.models import Medicine, ScrapingProgress, ScrapingLog
-        
-        # Create all tables
-        Base.metadata.create_all(bind=engine)
-        logger.info("PostgreSQL database tables created successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Error creating database tables: {e}")
-        return False
-
-def check_db_connection():
-    """Check database connection"""
-    try:
-        db = SessionLocal()
-        db.execute("SELECT 1")
-        db.close()
-        logger.info("PostgreSQL database connection successful")
-        return True
-    except Exception as e:
-        logger.error(f"Database connection error: {e}")
-        return False
+# For backward compatibility
+engine = None  # Will be set when get_engine() is called
+SessionLocal = None  # Will be set when get_session_local() is called
 
 def get_db():
-    """Get database session"""
-    db = SessionLocal()
+    """Get database session for VPS"""
+    db = get_session_local()()
     try:
         yield db
     finally:
