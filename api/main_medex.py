@@ -221,7 +221,7 @@ async def get_medicines(
     offset: int = Query(0, description="Number of medicines to skip"),
     search: Optional[str] = Query(None, description="Search in medicine names")
 ):
-    """Get medicines from database"""
+    """Get medicines from database with comprehensive data"""
     db = SessionLocal()
     try:
         query = db.query(Medicine)
@@ -232,24 +232,52 @@ async def get_medicines(
         total = query.count()
         medicines = query.offset(offset).limit(limit).all()
         
+        medicine_list = []
+        for med in medicines:
+            # Basic medicine data
+            medicine_data = {
+                "id": med.id,
+                "name": med.name,
+                "generic_name": med.generic_name,
+                "manufacturer": med.manufacturer,
+                "price": med.price,
+                "currency": med.currency,
+                "strength": med.strength,
+                "dosage_form": med.dosage_form,
+                "product_code": med.product_code,
+                "description": med.description,
+                "image_url": med.image_url,
+                "created_at": med.created_at,
+                "last_scraped": med.last_scraped
+            }
+            
+            # Extract additional data from raw_data if available
+            if med.raw_data:
+                raw_data = med.raw_data
+                extracted_fields = raw_data.get('extracted_fields', {})
+                
+                # Add comprehensive pricing information
+                medicine_data['unit_price'] = extracted_fields.get('unit_price')
+                medicine_data['strip_price'] = extracted_fields.get('strip_price')
+                medicine_data['pack_info'] = extracted_fields.get('pack_info')
+                
+                # Add metadata
+                medicine_data['page_title'] = extracted_fields.get('page_title')
+                medicine_data['meta_description'] = extracted_fields.get('meta_description')
+                
+                # Add common questions
+                medicine_data['common_questions'] = extracted_fields.get('common_questions')
+                
+                # Add detailed section data
+                medicine_data['detailed_info'] = extracted_fields.get('detailed_info')
+                
+                # Add price details
+                medicine_data['price_details'] = raw_data.get('price_details', {})
+            
+            medicine_list.append(medicine_data)
+        
         return {
-            "medicines": [
-                {
-                    "id": med.id,
-                    "name": med.name,
-                    "generic_name": med.generic_name,
-                    "manufacturer": med.manufacturer,
-                    "price": med.price,
-                    "currency": med.currency,
-                    "strength": med.strength,
-                    "dosage_form": med.dosage_form,
-                    "product_code": med.product_code,
-                    "product_url": med.product_url,
-                    "created_at": med.created_at,
-                    "last_scraped": med.last_scraped
-                }
-                for med in medicines
-            ],
+            "medicines": medicine_list,
             "total": total,
             "limit": limit,
             "offset": offset
@@ -262,7 +290,7 @@ async def get_medicines(
 
 @app.get("/medicines/{medicine_id}")
 async def get_medicine_detail(medicine_id: int):
-    """Get detailed information about a specific medicine"""
+    """Get detailed information about a specific medicine with comprehensive data"""
     db = SessionLocal()
     try:
         medicine = db.query(Medicine).filter_by(id=medicine_id).first()
@@ -273,6 +301,7 @@ async def get_medicine_detail(medicine_id: int):
         # Get associated image
         image = db.query(MedicineImage).filter_by(medicine_id=medicine_id).first()
         
+        # Basic medicine data
         result = {
             "id": medicine.id,
             "name": medicine.name,
@@ -284,11 +313,37 @@ async def get_medicine_detail(medicine_id: int):
             "dosage_form": medicine.dosage_form,
             "description": medicine.description,
             "product_code": medicine.product_code,
-            "product_url": medicine.product_url,
+            "image_url": medicine.image_url,
             "created_at": medicine.created_at,
             "last_scraped": medicine.last_scraped,
             "image": None
         }
+        
+        # Extract additional comprehensive data from raw_data if available
+        if medicine.raw_data:
+            raw_data = medicine.raw_data
+            extracted_fields = raw_data.get('extracted_fields', {})
+            
+            # Add comprehensive pricing information
+            result['unit_price'] = extracted_fields.get('unit_price')
+            result['strip_price'] = extracted_fields.get('strip_price')
+            result['pack_info'] = extracted_fields.get('pack_info')
+            
+            # Add metadata
+            result['page_title'] = extracted_fields.get('page_title')
+            result['meta_description'] = extracted_fields.get('meta_description')
+            
+            # Add common questions
+            result['common_questions'] = extracted_fields.get('common_questions')
+            
+            # Add detailed section data (all 12+ sections)
+            result['detailed_info'] = extracted_fields.get('detailed_info')
+            
+            # Add price details
+            result['price_details'] = raw_data.get('price_details', {})
+            
+            # Add product URL if available
+            result['product_url'] = extracted_fields.get('product_url')
         
         if image:
             result["image"] = {

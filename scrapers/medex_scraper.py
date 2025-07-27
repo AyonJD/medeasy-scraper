@@ -19,6 +19,7 @@ from database.models import Medicine, MedicineImage, ScrapingProgress, ScrapingL
 from database.connection_local import SessionLocal
 from scrapers.base_scraper import BaseScraper
 from utils.image_processor import ImageProcessor
+from utils.image_storage import ImageStorage
 from utils.html_storage import HtmlStorage
 from config import Config
 from sqlalchemy import func
@@ -29,6 +30,7 @@ class MedExScraper(BaseScraper):
         self.base_url = "https://medex.com.bd"
         self.task_name = "medex_scraper"
         self.image_processor = ImageProcessor()
+        self.image_storage = ImageStorage()  # Add ImageStorage for server URLs
         self.html_storage = HtmlStorage()
         self.ua = UserAgent()
         
@@ -247,122 +249,223 @@ class MedExScraper(BaseScraper):
         return medicine_links
     
     def extract_medicine_data(self, soup: BeautifulSoup, url: str) -> Dict[str, Any]:
-        """Extract medicine data from MedEx product page"""
+        """Extract medicine data from MedEx product page with complete data extraction"""
         medicine_data = {
             'product_url': url,
             'raw_data': {}
         }
         
         try:
-            # Extract medicine name - look for h1 or main title
-            name_selectors = [
-                'h1',
-                '.medicine-name',
-                '.product-name',
-                '.brand-name',
-                '[class*="title"]'
-            ]
+            # Extract medicine name from h1.brand
+            name_element = soup.select_one('h1.page-heading-1-l.brand')
+            if name_element:
+                # Get the main text without the dosage form subtitle
+                name_text = name_element.get_text(strip=True)
+                # Remove dosage form from name if it's at the end
+                dosage_subtitle = name_element.select_one('small.h1-subtitle')
+                if dosage_subtitle:
+                    dosage_form_text = dosage_subtitle.get_text(strip=True)
+                    name_text = name_text.replace(dosage_form_text, '').strip()
+                medicine_data['name'] = self.clean_text(name_text)
             
-            for selector in name_selectors:
-                element = soup.select_one(selector)
-                if element and element.get_text(strip=True):
-                    medicine_data['name'] = self.clean_text(element.get_text(strip=True))
-                    break
+            # Extract dosage form from h1 subtitle
+            dosage_element = soup.select_one('h1.page-heading-1-l.brand small.h1-subtitle')
+            if dosage_element:
+                medicine_data['dosage_form'] = self.clean_text(dosage_element.get_text(strip=True))
             
-            # Extract generic name - typically shown in the composition section
-            generic_selectors = [
-                '.generic-name',
-                '[class*="generic"]',
-                '[class*="composition"]'
-            ]
+            # Extract generic name from the generic name link
+            generic_element = soup.select_one('div[title="Generic Name"] a')
+            if generic_element:
+                medicine_data['generic_name'] = self.clean_text(generic_element.get_text(strip=True))
             
-            for selector in generic_selectors:
-                element = soup.select_one(selector)
-                if element and element.get_text(strip=True):
-                    text = element.get_text(strip=True)
-                    # Extract the first part which is usually the generic name
-                    if text:
-                        medicine_data['generic_name'] = self.clean_text(text.split(' ')[0])
-                    break
+            # Extract strength from div with title "Strength"
+            strength_element = soup.select_one('div[title="Strength"]')
+            if strength_element:
+                medicine_data['strength'] = self.clean_text(strength_element.get_text(strip=True))
             
-            # Extract manufacturer - look for company information
-            manufacturer_selectors = [
-                '.manufacturer',
-                '.company',
-                '[class*="manufacturer"]',
-                '[class*="company"]'
-            ]
+            # Extract manufacturer from div with title "Manufactured by"
+            manufacturer_element = soup.select_one('div[title="Manufactured by"] a')
+            if manufacturer_element:
+                medicine_data['manufacturer'] = self.clean_text(manufacturer_element.get_text(strip=True))
             
-            for selector in manufacturer_selectors:
-                element = soup.select_one(selector)
-                if element and element.get_text(strip=True):
-                    medicine_data['manufacturer'] = self.clean_text(element.get_text(strip=True))
-                    break
+            # Extract comprehensive pricing information
+            price_info = {}
+            unit_price = None
+            strip_price = None
+            pack_info = None
             
-            # Extract price information
-            price_selectors = [
-                '.price',
-                '[class*="price"]',
-                '.cost',
-                '.amount'
-            ]
+            # Unit price - Fixed to find the correct sibling span
+            try:
+                # Look for the package container which has the pricing structure
+                package_container = soup.select_one('.package-container')
+                if package_container:
+                    # Find all spans in the package container
+                    spans = package_container.find_all('span')
+                    for i, span in enumerate(spans):
+                        if span.get_text(strip=True) == "Unit Price:":
+                            # The price should be in the next span
+                            if i + 1 < len(spans):
+                                price_span = spans[i + 1]
+                                price_text = price_span.get_text(strip=True)
+                                price_match = re.search(r'৳\s*([\d,]+\.?\d*)', price_text)
+                                if price_match:
+                                    price_value = price_match.group(1).replace(',', '')
+                                    try:
+                                        medicine_data['price'] = float(price_value)
+                                        medicine_data['currency'] = 'BDT'
+                                        unit_price = f"৳ {price_value}"
+                                        price_info['unit_price'] = unit_price
+                                        logger.debug(f"Extracted unit price: {price_value}")
+                                        break
+                                    except ValueError:
+                                        pass
+                        elif span.get_text(strip=True) == "Strip Price:":
+                            # The strip price should be in the next span
+                            if i + 1 < len(spans):
+                                price_span = spans[i + 1]
+                                price_text = price_span.get_text(strip=True)
+                                price_match = re.search(r'৳\s*([\d,]+\.?\d*)', price_text)
+                                if price_match:
+                                    strip_price = f"৳ {price_match.group(1)}"
+                                    price_info['strip_price'] = strip_price
+                                    logger.debug(f"Extracted strip price: {price_match.group(1)}")
+            except Exception as e:
+                logger.debug(f"Error extracting prices from package container: {e}")
             
-            for selector in price_selectors:
-                element = soup.select_one(selector)
-                if element and element.get_text(strip=True):
-                    price_text = element.get_text(strip=True)
-                    price = self.extract_price(price_text)
-                    if price:
-                        medicine_data['price'] = price
-                        medicine_data['currency'] = 'BDT'
-                    break
+            # Pack price (like "6 x 10: ৳ 720.00")
+            pack_price_element = soup.select_one('.pack-size-info')
+            if pack_price_element:
+                pack_text = pack_price_element.get_text(strip=True)
+                pack_info = pack_text
+                price_info['pack_info'] = pack_text
+                logger.debug(f"Extracted pack info: {pack_text}")
             
-            # Extract strength/dosage from the name or composition
-            if medicine_data.get('name'):
-                strength_match = re.search(r'(\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|%|IU))', medicine_data['name'])
-                if strength_match:
-                    medicine_data['strength'] = strength_match.group(1)
+            # Store individual pricing fields
+            medicine_data['unit_price'] = unit_price
+            medicine_data['strip_price'] = strip_price
+            medicine_data['pack_info'] = pack_info
             
-            # Extract dosage form from name
-            dosage_forms = ['tablet', 'capsule', 'syrup', 'injection', 'cream', 'ointment', 'drops', 'suspension', 'powder']
-            name_lower = medicine_data.get('name', '').lower()
-            for form in dosage_forms:
-                if form in name_lower:
-                    medicine_data['dosage_form'] = form.title()
-                    break
-            
-            # Extract description from various sections
-            desc_selectors = [
-                '.description',
-                '.indications',
-                '.details',
-                '[class*="indication"]',
-                '[class*="description"]'
-            ]
-            
+            # Extract comprehensive description from all available sections
             descriptions = []
-            for selector in desc_selectors:
-                elements = soup.select(selector)
-                for element in elements:
-                    text = element.get_text(strip=True)
-                    if text and len(text) > 20:  # Only meaningful descriptions
-                        descriptions.append(text)
             
+            # List of all sections to extract
+            sections = [
+                ('indications', 'Indications'),
+                ('composition', 'Composition'),
+                ('mode_of_action', 'Pharmacology'), 
+                ('dosage', 'Dosage & Administration'),
+                ('interaction', 'Interaction'),
+                ('contraindications', 'Contraindications'),
+                ('side_effects', 'Side Effects'),
+                ('pregnancy_cat', 'Pregnancy & Lactation'),
+                ('precautions', 'Precautions & Warnings'),
+                ('pediatric_uses', 'Use in Special Populations'),
+                ('overdose_effects', 'Overdose Effects'),
+                ('drug_classes', 'Therapeutic Class'),
+                ('storage_conditions', 'Storage Conditions')
+            ]
+            
+            section_data = {}
+            for section_id, section_name in sections:
+                section_element = soup.select_one(f'#{section_id}')
+                if section_element:
+                    # Find the corresponding body content - try multiple approaches
+                    body_element = None
+                    
+                    # Method 1: Direct sibling
+                    body_element = section_element.find_next_sibling('div', class_='ac-body')
+                    
+                    # Method 2: Parent's next sibling (if wrapped in a div)
+                    if not body_element and section_element.parent:
+                        body_element = section_element.parent.find('div', class_='ac-body')
+                    
+                    # Method 3: Look in parent container
+                    if not body_element:
+                        parent_div = section_element.find_parent('div')
+                        if parent_div:
+                            body_element = parent_div.find('div', class_='ac-body')
+                    
+                    if body_element:
+                        content = body_element.get_text(strip=True)
+                        if content and len(content) > 5:  # Lower threshold for meaningful content
+                            # Clean up the content
+                            content = re.sub(r'\s+', ' ', content)  # Normalize whitespace
+                            content = content.replace('* রেজিস্টার্ড চিকিৎসকের পরামর্শ মোতাবেক ঔষধ সেবন করুন', '').strip()
+                            
+                            if content:  # Only if there's still content after cleaning
+                                section_key = section_name.lower().replace(' & ', '_').replace(' ', '_').replace('&', 'and')
+                                section_data[section_key] = content
+                                descriptions.append(f"{section_name}: {content}")
+                                logger.debug(f"✅ Extracted {section_name}: {len(content)} chars")
+                        else:
+                            logger.debug(f"⚠️ {section_name}: No meaningful content found (length: {len(content) if content else 0})")
+                    else:
+                        logger.debug(f"❌ {section_name}: No body element found for #{section_id}")
+            
+            # Extract Common Questions section
+            common_questions = []
+            questions_section = soup.select_one('#commonly_asked_questions')
+            if questions_section:
+                # Find the corresponding body content
+                questions_body = questions_section.find_next_sibling('div', class_='ac-body')
+                if questions_body:
+                    # Extract individual Q&A pairs
+                    qa_pairs = questions_body.select('.caq')
+                    for qa in qa_pairs:
+                        question_elem = qa.select_one('.caq-q')
+                        answer_elem = qa.select_one('.caq-a')
+                        if question_elem and answer_elem:
+                            question = question_elem.get_text(strip=True)
+                            answer = answer_elem.get_text(strip=True)
+                            common_questions.append({'question': question, 'answer': answer})
+                    
+                    if common_questions:
+                        medicine_data['common_questions'] = common_questions
+                        # Add to descriptions as well
+                        qa_text = ' | '.join([f"Q: {qa['question']} A: {qa['answer']}" for qa in common_questions])
+                        descriptions.append(f"Common Questions: {qa_text}")
+                        logger.debug(f"Extracted {len(common_questions)} common questions")
+            
+            # Create comprehensive description with ALL sections
             if descriptions:
-                medicine_data['description'] = ' | '.join(descriptions[:3])  # Limit to first 3 descriptions
+                # Store detailed sections separately
+                medicine_data['detailed_info'] = section_data
+                # Create main description with ALL extracted sections - NO LIMIT!
+                medicine_data['description'] = ' | '.join(descriptions)
+                logger.debug(f"Created comprehensive description with {len(descriptions)} sections")
+            
+            # Store pricing info in raw_data
+            if price_info:
+                medicine_data['price_info'] = price_info
             
             # Generate product code from URL
             url_parts = url.split('/')
             if len(url_parts) >= 2:
-                medicine_data['product_code'] = f"MX_{url_parts[-2]}"  # Use the ID from URL
-            else:
-                medicine_data['product_code'] = f"MX_{hash(url) % 1000000:06d}"
+                try:
+                    medicine_id = url_parts[-2] if url_parts[-2].isdigit() else url_parts[-1].split('-')[0]
+                    medicine_data['product_code'] = f"MX_{medicine_id}"
+                except:
+                    medicine_data['product_code'] = f"MX_{hash(url) % 1000000:06d}"
             
-            # Store raw HTML data
+            # Extract additional metadata from page title and meta tags
+            title_element = soup.select_one('title')
+            if title_element:
+                title_text = title_element.get_text(strip=True)
+                medicine_data['page_title'] = title_text
+            
+            # Extract meta description
+            meta_desc = soup.select_one('meta[name="description"]')
+            if meta_desc:
+                medicine_data['meta_description'] = meta_desc.get('content', '').strip()
+            
+            # Store comprehensive raw data
             medicine_data['raw_data'] = {
                 'html_content': str(soup),
                 'url': url,
-                'extracted_fields': {k: v for k, v in medicine_data.items() if k not in ['raw_data', 'product_url']}
+                'extracted_fields': {k: v for k, v in medicine_data.items() if k not in ['raw_data', 'product_url']},
+                'section_data': section_data if 'section_data' in locals() else {},
+                'price_details': price_info,
+                'common_questions': common_questions if common_questions else []
             }
             
         except Exception as e:
@@ -372,25 +475,70 @@ class MedExScraper(BaseScraper):
         return medicine_data
     
     def extract_image_url(self, soup: BeautifulSoup) -> Optional[str]:
-        """Extract image URL from MedEx medicine page"""
+        """Extract image URL from MedEx medicine page - specifically pack images"""
         try:
-            # Look for product/medicine images
-            image_selectors = [
-                'img[src*="pack"]',
-                'img[alt*="pack"]',
+            # Method 1: Extract from Pack Images button (most reliable)
+            pack_images_btn = soup.select_one('a.innovator-brand-badge[data-mp-objects]')
+            if pack_images_btn:
+                href = pack_images_btn.get('href')
+                if href and 'storage/images/packaging' in href:
+                    # Convert relative URLs to absolute
+                    if href.startswith('/'):
+                        href = urljoin(self.base_url, href)
+                    return href
+            
+            # Method 2: Extract from pack images section at bottom
+            pack_images = soup.select('div[style*="margin: 10px"] a[href*="storage/images/packaging"]')
+            if pack_images:
+                for img_link in pack_images:
+                    href = img_link.get('href')
+                    if href:
+                        # Convert relative URLs to absolute
+                        if href.startswith('/'):
+                            href = urljoin(self.base_url, href)
+                        return href
+            
+            # Method 3: Direct image elements with pack image URLs
+            pack_img_elements = soup.select('img[src*="storage/images/packaging"]')
+            if pack_img_elements:
+                for img in pack_img_elements:
+                    src = img.get('src')
+                    if src:
+                        # Convert relative URLs to absolute
+                        if src.startswith('/'):
+                            src = urljoin(self.base_url, src)
+                        return src
+            
+            # Method 4: Look for any images with "pack" in alt text or filename
+            pack_alt_images = soup.select('img[alt*="Pack"], img[src*="pack"], img[alt*="packaging"]')
+            if pack_alt_images:
+                for img in pack_alt_images:
+                    src = img.get('src') or img.get('data-src')
+                    if src and ('storage/images' in src or 'pack' in src.lower()):
+                        # Convert relative URLs to absolute
+                        if src.startswith('/'):
+                            src = urljoin(self.base_url, src)
+                        elif not src.startswith('http'):
+                            src = urljoin(self.base_url, src)
+                        
+                        # Ensure it's from the same domain and not a generic icon
+                        if self.base_url in src and 'dosage-forms' not in src:
+                            return src
+            
+            # Method 5: Check for any medicine/product images as fallback
+            general_selectors = [
+                'img[src*="medicine"]',
+                'img[src*="tablet"]',
+                'img[src*="capsule"]',
                 'img[alt*="medicine"]',
-                'img[alt*="tablet"]',
-                'img[alt*="capsule"]',
                 '.product-image img',
-                '.medicine-image img',
-                'img[src*="product"]',
-                'img[src*="medicine"]'
+                '.medicine-image img'
             ]
             
-            for selector in image_selectors:
+            for selector in general_selectors:
                 img = soup.select_one(selector)
                 if img:
-                    src = img.get('src')
+                    src = img.get('src') or img.get('data-src')
                     if src:
                         # Convert relative URLs to absolute
                         if src.startswith('/'):
@@ -398,8 +546,8 @@ class MedExScraper(BaseScraper):
                         elif not src.startswith('http'):
                             src = urljoin(self.base_url, src)
                         
-                        # Ensure it's from the same domain
-                        if self.base_url in src:
+                        # Ensure it's from the same domain and not a generic icon
+                        if self.base_url in src and 'dosage-forms' not in src and 'logo' not in src.lower():
                             return src
             
             return None
@@ -408,18 +556,35 @@ class MedExScraper(BaseScraper):
             logger.error(f"Error extracting image URL: {e}")
             return None
     
-    def process_medicine_image(self, image_url: str) -> Optional[Dict]:
-        """Download and process medicine image to WebP format"""
+    def process_medicine_image(self, image_url: str, medicine_id: int = None) -> Optional[Dict]:
+        """Download and process medicine image to WebP format and save to server"""
         if not image_url:
             return None
         
         try:
             logger.debug(f"Processing image: {image_url}")
+            # Download and convert to WebP
             image_data = self.image_processor.download_and_convert_to_webp(image_url)
             
             if image_data:
-                logger.info(f"Successfully processed image: {image_data['width']}x{image_data['height']}, {image_data['file_size']} bytes")
-                return image_data
+                # Use a temporary ID if medicine_id not provided yet
+                temp_id = medicine_id or hash(image_url) % 1000000
+                
+                # Save to filesystem and get server URL
+                server_image_url = self.image_storage.save_image(
+                    image_data['image_data'], 
+                    temp_id, 
+                    image_url
+                )
+                
+                if server_image_url:
+                    # Add server URL to the image data
+                    image_data['server_url'] = server_image_url
+                    logger.info(f"Successfully processed and saved image: {image_data['width']}x{image_data['height']}, {image_data['file_size']} bytes -> {server_image_url}")
+                    return image_data
+                else:
+                    logger.warning(f"Failed to save image to server: {image_url}")
+                    return None
             else:
                 logger.warning(f"Failed to process image: {image_url}")
                 return None
@@ -438,9 +603,9 @@ class MedExScraper(BaseScraper):
                 existing = db.query(Medicine).filter_by(product_code=medicine_data['product_code']).first()
             
             if existing:
-                # Update existing record
+                # Update existing record - filter out non-model fields but keep raw_data
                 for key, value in medicine_data.items():
-                    if key not in ['raw_data', 'product_url'] and hasattr(existing, key):
+                    if key not in ['product_url'] and hasattr(existing, key):
                         setattr(existing, key, value)
                 existing.last_scraped = func.now()
                 
@@ -448,23 +613,43 @@ class MedExScraper(BaseScraper):
                 if html_url and hasattr(existing, 'html_url'):
                     existing.html_url = html_url
                 
+                # Set image_url from processed image data
+                if image_data and 'server_url' in image_data:
+                    existing.image_url = image_data['server_url']
+                    logger.debug(f"Updated image_url: {image_data['server_url']}")
+                
+                # IMPORTANT: Save comprehensive raw_data to database
+                if 'raw_data' in medicine_data:
+                    existing.raw_data = medicine_data['raw_data']
+                    logger.debug(f"Updated raw_data with comprehensive information")
+                
                 logger.info(f"Updated existing medicine: {medicine_data.get('name', 'Unknown')}")
                 medicine = existing
             else:
-                # Create new record - filter out non-model fields
+                # Create new record - filter out non-model fields but keep raw_data
                 model_fields = {k: v for k, v in medicine_data.items() 
-                              if k not in ['raw_data', 'product_url'] and hasattr(Medicine, k)}
+                              if k not in ['product_url'] and hasattr(Medicine, k)}
                 
                 # Add HTML URL if the model supports it
                 if html_url and hasattr(Medicine, 'html_url'):
                     model_fields['html_url'] = html_url
+                
+                # Set image_url from processed image data
+                if image_data and 'server_url' in image_data:
+                    model_fields['image_url'] = image_data['server_url']
+                    logger.debug(f"Setting image_url: {image_data['server_url']}")
+                
+                # IMPORTANT: Ensure comprehensive raw_data is saved to database
+                if 'raw_data' in medicine_data:
+                    model_fields['raw_data'] = medicine_data['raw_data']
+                    logger.debug(f"Setting raw_data with comprehensive information")
                 
                 medicine = Medicine(**model_fields)
                 db.add(medicine)
                 db.flush()  # Get the ID
                 logger.info(f"Added new medicine: {medicine_data.get('name', 'Unknown')} (ID: {medicine.id})")
             
-            # Process and save image if provided
+            # Process and save image to database if provided
             if image_data:
                 try:
                     # Check if image already exists for this medicine
@@ -531,7 +716,7 @@ class MedExScraper(BaseScraper):
             # Save HTML content to filesystem
             html_url = None
             try:
-                # Generate a temporary medicine ID for HTML storage (we'll update after DB save)
+                # Generate a temporary medicine ID for HTML storage
                 temp_id = hash(url) % 1000000
                 html_url = self.html_storage.save_html(content, temp_id, url)
                 if html_url:
@@ -539,14 +724,16 @@ class MedExScraper(BaseScraper):
             except Exception as e:
                 logger.error(f"Failed to save HTML content: {e}")
             
-            # Extract and process image
+            # Extract and process image with server storage
             image_data = None
             image_url = self.extract_image_url(soup)
             if image_url:
                 logger.debug(f"Found image URL: {image_url}")
+                # Process image without medicine_id first (will use temp_id)
                 image_data = self.process_medicine_image(image_url)
                 if image_data:
                     logger.info(f"Successfully processed image: {image_data['width']}x{image_data['height']}, {image_data['file_size']} bytes")
+                    logger.info(f"Image saved to server: {image_data['server_url']}")
                 else:
                     logger.warning(f"Failed to process image from: {image_url}")
             else:
